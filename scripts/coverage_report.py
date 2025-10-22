@@ -145,14 +145,63 @@ def main() -> None:
         action="store_true",
         help="Emit JSON instead of human-readable text.",
     )
+    parser.add_argument(
+        "--material",
+        action="append",
+        dest="materials",
+        help="Only include records matching the given chemical formula. Repeat for multiple.",
+    )
+    parser.add_argument(
+        "--code",
+        action="append",
+        dest="codes",
+        help="Only include records matching the given simulation code name. Repeat for multiple.",
+    )
     args = parser.parse_args()
 
     client = CascadesDBClient(cache_dir=args.cache)
     records = _collect_records(client, args.refresh or args.force_refresh, args.force_refresh)
+
+    material_args = [value.strip() for value in (args.materials or []) if value.strip()]
+    code_args = [value.strip() for value in (args.codes or []) if value.strip()]
+    materials_filter = {value.lower() for value in material_args} or None
+    codes_filter = {value.lower() for value in code_args} or None
+
+    if materials_filter or codes_filter:
+        filtered_records = []
+        for record in records:
+            material = record.material or {}
+            formula = (material.get("chemical-formula") or material.get("formula") or "").lower()
+            code_name = (record.data.get("code", {}).get("name") or "").lower()
+
+            if materials_filter and formula not in materials_filter:
+                continue
+            if codes_filter and code_name not in codes_filter:
+                continue
+            filtered_records.append(record)
+        records = filtered_records
+
     stats = build_statistics(records)
+    filters = {}
+    if material_args:
+        filters["materials"] = list(dict.fromkeys(material_args))
+    if code_args:
+        filters["codes"] = list(dict.fromkeys(code_args))
 
     if args.json_output:
+        if filters:
+            stats = dict(stats)
+            stats["filters"] = filters
         print(json.dumps(stats, indent=2, sort_keys=True))
+        return
+
+    if material_args:
+        print(f"Filtered materials: {', '.join(filters['materials'])}")
+    if code_args:
+        print(f"Filtered codes: {', '.join(filters['codes'])}")
+
+    if not records:
+        print("No records matched the selected filters.")
         return
 
     print(f"Total records: {stats['total_records']}")
