@@ -9,7 +9,6 @@ defect information using the cedar post-processing utility.
 import os
 import subprocess
 import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -191,47 +190,39 @@ def main():
     print(f"Output directory: {OUTPUT_BASE_DIR}")
     print("-" * 80)
 
-    # Thread-safe lock for progress updates
-    lock = threading.Lock()
-
-    def process_with_progress(n, m):
-        """Wrapper to process and report progress."""
-        nonlocal processed, success, failed, skipped
-
-        result = process_cascade(n, m, args.dry_run, args.show_output)
-
-        # Thread-safe progress update
-        with lock:
-            processed += 1
-            if result is True:
-                success += 1
-            elif result is False:
-                failed += 1
-            else:
-                skipped += 1
-
-            elapsed = (datetime.now() - start_time).total_seconds() / 60
-            rate = processed / elapsed if elapsed > 0 else 0
-            eta = (total - processed) / rate if rate > 0 else 0
-            print(f"Progress: {processed}/{total} ({100*processed/total:.1f}%) "
-                    f"- Success: {success}, Failed: {failed}, Skipped: {skipped} "
-                    f"- Rate: {rate:.1f} sim/min, ETA: {eta:.1f} min")
-
-        return result
-
     # Submit all tasks
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
         futures = [
-            executor.submit(process_with_progress, n, m)
+            executor.submit(process_cascade, n, m, args.dry_run, args.show_output)
             for n in range(args.n_start, args.n_end + 1)
             for m in range(args.m_start, args.m_end + 1)
         ]
 
-        # Wait for all to complete
+        # Wait for completion and update progress from main thread
         for future in as_completed(futures):
             try:
-                future.result()
+                result = future.result()
+
+                # Update counters
+                processed += 1
+                if result is True:
+                    success += 1
+                elif result is False:
+                    failed += 1
+                else:
+                    skipped += 1
+
+                # Print progress update from main thread
+                elapsed = (datetime.now() - start_time).total_seconds() / 60
+                rate = processed / elapsed if elapsed > 0 else 0
+                eta = (total - processed) / rate if rate > 0 else 0
+                print(f"Progress: {processed}/{total} ({100*processed/total:.1f}%) "
+                      f"- Success: {success}, Failed: {failed}, Skipped: {skipped} "
+                      f"- Rate: {rate:.1f} sim/min, ETA: {eta:.1f} min")
+
             except Exception as e:
+                processed += 1
+                failed += 1
                 print(f"ERROR: Unexpected exception in thread: {e}", file=sys.stderr)
 
     # Final summary
