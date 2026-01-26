@@ -45,18 +45,18 @@ def check_prerequisites():
     return True
 
 
-def process_cascade(n, m, dry_run=False, show_output=False):
+def cedar_defect_analysis(reference_dump, displaced_dump, output_dir=None, show_output=False):
     """
-    Process a single cascade simulation.
+    Run cedar defect analysis on a displaced dump file.
 
     Parameters:
     -----------
-    n : int
-        Starting state number (1-100)
-    m : int
-        PKA angle number (1-10)
-    dry_run : bool
-        If True, only print commands without executing
+    reference_dump : str or Path
+        Path to the reference lattice dump file
+    displaced_dump : str or Path
+        Path to the displaced dump file to analyze
+    output_dir : str or Path, optional
+        Directory where cedar output files will be written (default: current directory)
     show_output : bool
         If True, stream cedar stdout/stderr to the console
 
@@ -64,34 +64,34 @@ def process_cascade(n, m, dry_run=False, show_output=False):
     --------
     bool : True if successful, False otherwise
     """
-    # Input file path
-    dump_file = Path(BASE_DUMP_DIR) / str(n) / str(m) / "dump.end.min"
+    reference_dump = Path(reference_dump)
+    displaced_dump = Path(displaced_dump)
 
-    # Output directory
-    output_dir = Path(OUTPUT_BASE_DIR) / str(n) / str(m)
+    if output_dir is None:
+        output_dir = Path.cwd()
+    else:
+        output_dir = Path(output_dir)
 
-    # Check if input file exists
-    if not dump_file.exists():
-        print(f"WARNING: Dump file not found: {dump_file}", file=sys.stderr)
+    # Check if input files exist
+    if not reference_dump.exists():
+        print(f"ERROR: Reference dump not found: {reference_dump}", file=sys.stderr)
+        return False
+
+    if not displaced_dump.exists():
+        print(f"WARNING: Displaced dump not found: {displaced_dump}", file=sys.stderr)
         return False
 
     # Create output directory
-    if not dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Prepare cedar command
     cmd = [
         CEDAR_EXECUTABLE,
         "-defect",
-        str(REFERENCE_FILE),
+        str(reference_dump),
         "--fin",
-        str(dump_file)
+        str(displaced_dump)
     ]
-
-    if dry_run:
-        print(f"[DRY RUN] Would run in {output_dir}:")
-        print(f"  {' '.join(cmd)}")
-        return True
 
     # Run cedar in the output directory
     try:
@@ -104,7 +104,7 @@ def process_cascade(n, m, dry_run=False, show_output=False):
         )
 
         if result.returncode != 0:
-            print(f"ERROR: Cedar failed for N={n}, M={m}", file=sys.stderr)
+            print(f"ERROR: Cedar failed for {displaced_dump}", file=sys.stderr)
             if not show_output and result.stderr:
                 print(f"  STDERR: {result.stderr}", file=sys.stderr)
             return False
@@ -112,10 +112,10 @@ def process_cascade(n, m, dry_run=False, show_output=False):
         return True
 
     except subprocess.TimeoutExpired:
-        print(f"ERROR: Cedar timed out for N={n}, M={m}", file=sys.stderr)
+        print(f"ERROR: Cedar timed out for {displaced_dump}", file=sys.stderr)
         return False
     except Exception as e:
-        print(f"ERROR: Exception processing N={n}, M={m}: {e}", file=sys.stderr)
+        print(f"ERROR: Exception processing {displaced_dump}: {e}", file=sys.stderr)
         return False
 
 
@@ -192,11 +192,29 @@ def main():
 
     # Submit all tasks
     with ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        futures = [
-            executor.submit(process_cascade, n, m, args.dry_run, args.show_output)
-            for n in range(args.n_start, args.n_end + 1)
-            for m in range(args.m_start, args.m_end + 1)
-        ]
+        futures = []
+        for n in range(args.n_start, args.n_end + 1):
+            for m in range(args.m_start, args.m_end + 1):
+                # Build paths for this cascade
+                displaced_dump = Path(BASE_DUMP_DIR) / str(n) / str(m) / "dump.end.min"
+                output_dir = Path(OUTPUT_BASE_DIR) / str(n) / str(m)
+
+                if args.dry_run:
+                    print(f"[DRY RUN] Would run cedar for N={n}, M={m}")
+                    print(f"  Reference: {REFERENCE_FILE}")
+                    print(f"  Displaced: {displaced_dump}")
+                    print(f"  Output: {output_dir}")
+                    processed += 1
+                    success += 1
+                else:
+                    future = executor.submit(
+                        cedar_defect_analysis,
+                        REFERENCE_FILE,
+                        displaced_dump,
+                        output_dir,
+                        args.show_output
+                    )
+                    futures.append(future)
 
         # Wait for completion and update progress from main thread
         for future in as_completed(futures):
