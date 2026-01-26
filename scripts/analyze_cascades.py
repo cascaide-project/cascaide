@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Analyze cascade simulation dump files using cedar to extract vacancy/SIA information.
+Analyze cascade configurations using cedar to extract vacancy/SIA information.
 
-This script processes 1000 cascade simulations (N=1-100, M=1-10) and generates
+This script processes 1000 cascade configurations (N=1-100, M=1-10) and generates
 defect information using the cedar post-processing utility.
 """
 
@@ -20,7 +20,7 @@ REFERENCE_FILE = "/flare/Cascaide/knight/lammps/W_Chen19_Jan2026/sc80/therm/dump
 BASE_DUMP_DIR = "/flare/Cascaide/knight/lammps/W_Chen19_Jan2026/sc80/50keV/pka1"
 OUTPUT_BASE_DIR = "/flare/Cascaide/romano/defect_analysis/sc80_50keV_pka1"
 
-# Range of simulations
+# Range of configurations
 N_RANGE = range(1, 101)  # 1 to 100
 M_RANGE = range(1, 11)   # 1 to 10
 
@@ -36,10 +36,6 @@ def check_prerequisites():
 
     if not cedar_path.is_file() or not os.access(cedar_path, os.X_OK):
         print(f"ERROR: Cedar executable is not executable: {CEDAR_EXECUTABLE}", file=sys.stderr)
-        return False
-
-    if not ref_path.exists():
-        print(f"ERROR: Reference file not found at {REFERENCE_FILE}", file=sys.stderr)
         return False
 
     return True
@@ -124,7 +120,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Process cascade simulations with cedar defect analysis"
+        description="Process cascade configurations with cedar defect analysis"
     )
     parser.add_argument(
         "--dry-run",
@@ -175,7 +171,7 @@ def main():
             return 1
 
     # Statistics
-    total = (args.n_end - args.n_start + 1) * (args.m_end - args.m_start + 1)
+    total = 2 * (args.n_end - args.n_start + 1) * (args.m_end - args.m_start + 1)
     processed = 0
     success = 0
     failed = 0
@@ -184,7 +180,7 @@ def main():
     start_time = datetime.now()
 
     print(f"Starting cascade analysis at {start_time}")
-    print(f"Processing {total} simulations (N={args.n_start}-{args.n_end}, M={args.m_start}-{args.m_end})")
+    print(f"Processing {total} configurations (N={args.n_start}-{args.n_end}, M={args.m_start}-{args.m_end})")
     print(f"Reference file: {REFERENCE_FILE}")
     print(f"Cedar executable: {CEDAR_EXECUTABLE}")
     print(f"Output directory: {OUTPUT_BASE_DIR}")
@@ -195,26 +191,42 @@ def main():
         futures = []
         for n in range(args.n_start, args.n_end + 1):
             for m in range(args.m_start, args.m_end + 1):
-                # Build paths for this cascade
-                displaced_dump = Path(BASE_DUMP_DIR) / str(n) / str(m) / "dump.end.min"
-                output_dir = Path(OUTPUT_BASE_DIR) / str(n) / str(m)
+                # Build paths for this cascade - both minimized and unminimized
+                base_dir = Path(BASE_DUMP_DIR) / str(n) / str(m)
+                dump_end_min = base_dir / "dump.end.min"
+                dump_end = base_dir / "dump.end"
+
+                output_base = Path(OUTPUT_BASE_DIR) / str(n) / str(m)
+                output_dir_min = output_base / "minimized"
+                output_dir_unmin = output_base / "unminimized"
 
                 if args.dry_run:
                     print(f"[DRY RUN] Would run cedar for N={n}, M={m}")
                     print(f"  Reference: {REFERENCE_FILE}")
-                    print(f"  Displaced: {displaced_dump}")
-                    print(f"  Output: {output_dir}")
+                    print(f"  Minimized - Displaced: {dump_end_min}, Output: {output_dir_min}")
+                    print(f"  Unminimized - Displaced: {dump_end}, Output: {output_dir_unmin}")
                     processed += 1
                     success += 1
                 else:
-                    future = executor.submit(
+                    # Submit task for minimized configuration
+                    future_min = executor.submit(
                         cedar_defect_analysis,
                         REFERENCE_FILE,
-                        displaced_dump,
-                        output_dir,
+                        dump_end_min,
+                        output_dir_min,
                         args.show_output
                     )
-                    futures.append(future)
+                    futures.append(future_min)
+
+                    # Submit task for unminimized configuration
+                    future_unmin = executor.submit(
+                        cedar_defect_analysis,
+                        REFERENCE_FILE,
+                        dump_end,
+                        output_dir_unmin,
+                        args.show_output
+                    )
+                    futures.append(future_unmin)
 
         # Wait for completion and update progress from main thread
         for future in as_completed(futures):
