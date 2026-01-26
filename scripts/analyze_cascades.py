@@ -9,8 +9,10 @@ defect information using the cedar post-processing utility.
 import os
 import subprocess
 import sys
-from pathlib import Path
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 
 
 # Configuration
@@ -94,9 +96,6 @@ def process_cascade(n, m, dry_run=False, show_output=False):
 
     # Run cedar in the output directory
     try:
-        # When show_output is enabled, inherit stdout/stderr so progress is visible.
-        # When not showing output, redirect stdout to DEVNULL to avoid pipe buffer deadlock
-        # (cedar can produce large output), but capture stderr for error reporting.
         result = subprocess.run(
             cmd,
             cwd=str(output_dir),
@@ -192,20 +191,17 @@ def main():
     print(f"Output directory: {OUTPUT_BASE_DIR}")
     print("-" * 80)
 
-    if args.parallel > 1:
-        # Parallel processing
-        from multiprocessing import Pool
+    # Thread-safe lock for progress updates
+    lock = threading.Lock()
 
-        tasks = [
-            (n, m, args.dry_run, args.show_output)
-            for n in range(args.n_start, args.n_end + 1)
-            for m in range(args.m_start, args.m_end + 1)
-        ]
+    def process_with_progress(n, m):
+        """Wrapper to process and report progress."""
+        nonlocal processed, success, failed, skipped
 
-        with Pool(processes=args.parallel) as pool:
-            results = pool.starmap(process_cascade, tasks)
+        result = process_cascade(n, m, args.dry_run, args.show_output)
 
-        for result in results:
+        # Thread-safe progress update
+        with lock:
             processed += 1
             if result is True:
                 success += 1
@@ -213,27 +209,30 @@ def main():
                 failed += 1
             else:
                 skipped += 1
-    else:
-        # Sequential processing
-        for n in range(args.n_start, args.n_end + 1):
-            for m in range(args.m_start, args.m_end + 1):
-                result = process_cascade(n, m, args.dry_run, args.show_output)
 
-                # Progress update every 10 simulations
-                processed += 1
-                elapsed = (datetime.now() - start_time).total_seconds() / 60
-                rate = processed / elapsed if elapsed > 0 else 0
-                eta = (total - processed) / rate if rate > 0 else 0
-                print(f"Progress: {processed}/{total} ({100*processed/total:.1f}%) "
-                        f"- Success: {success}, Failed: {failed}, Skipped: {skipped} "
-                        f"- Rate: {rate:.1f} sim/min, ETA: {eta:.1f} min")
+            elapsed = (datetime.now() - start_time).total_seconds() / 60
+            rate = processed / elapsed if elapsed > 0 else 0
+            eta = (total - processed) / rate if rate > 0 else 0
+            print(f"Progress: {processed}/{total} ({100*processed/total:.1f}%) "
+                    f"- Success: {success}, Failed: {failed}, Skipped: {skipped} "
+                    f"- Rate: {rate:.1f} sim/min, ETA: {eta:.1f} min")
 
-                if result is True:
-                    success += 1
-                elif result is False:
-                    failed += 1
-                else:
-                    skipped += 1
+        return result
+
+    # Submit all tasks
+    with ThreadPoolExecutor(max_workers=args.parallel) as executor:
+        futures = [
+            executor.submit(process_with_progress, n, m)
+            for n in range(args.n_start, args.n_end + 1)
+            for m in range(args.m_start, args.m_end + 1)
+        ]
+
+        # Wait for all to complete
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"ERROR: Unexpected exception in thread: {e}", file=sys.stderr)
 
     # Final summary
     end_time = datetime.now()
