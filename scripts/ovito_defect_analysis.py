@@ -8,17 +8,17 @@ is designed as an open-source replacement for the cedar ``-defect`` command.
 
 Usage::
 
-    # Basic usage (matches cedar workflow)
-    python ovito_defect_analysis.py dump.reference --fin dump.end.min
+    # Basic usage
+    python ovito_defect_analysis.py dump.reference dump.end.min
 
     # With output directory
-    python ovito_defect_analysis.py dump.reference --fin dump.end.min --output-dir ./defects
+    python ovito_defect_analysis.py dump.reference dump.end.min --output-dir ./defects
 
     # With visualization
-    python ovito_defect_analysis.py dump.reference --fin dump.end.min --visualize
+    python ovito_defect_analysis.py dump.reference dump.end.min --visualize
 
     # Data only (no dump files)
-    python ovito_defect_analysis.py dump.reference --fin dump.end.min --no-dump-files
+    python ovito_defect_analysis.py dump.reference dump.end.min --no-dump-files
 
 Requirements:
     - ovito (``pip install ovito``)
@@ -704,9 +704,9 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  %(prog)s dump.reference --fin dump.end.min\n"
-            "  %(prog)s dump.reference --fin dump.end.min --output-dir ./defects\n"
-            "  %(prog)s dump.reference --fin dump.end.min --visualize\n"
+            "  %(prog)s dump.reference dump.end.min\n"
+            "  %(prog)s dump.reference dump.end.min --output-dir ./defects\n"
+            "  %(prog)s dump.reference dump.end.min --visualize\n"
         ),
     )
 
@@ -715,9 +715,7 @@ def main(argv=None):
         help="Path to reference LAMMPS dump file (perfect lattice).",
     )
     parser.add_argument(
-        "--fin",
-        required=True,
-        dest="displaced",
+        "displaced",
         help="Path to displaced LAMMPS dump file (after cascade).",
     )
     parser.add_argument(
