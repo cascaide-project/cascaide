@@ -184,7 +184,7 @@ def analyze_defects(
     """
     from ovito.io import import_file as ovito_import
     from ovito.modifiers import WignerSeitzAnalysisModifier
-    from ovito.pipeline import FileSource
+    from ovito.pipeline import FileSource, ReferenceConfigurationModifier
 
     reference_file = str(Path(reference_file).resolve())
     displaced_file = str(Path(displaced_file).resolve())
@@ -208,6 +208,7 @@ def analyze_defects(
     logger.info("Running Wigner-Seitz analysis (reference-site mode) ...")
     pipeline_ref = ovito_import(displaced_file)
     ws_ref = WignerSeitzAnalysisModifier(output_displaced=False)
+    ws_ref.affine_mapping = ReferenceConfigurationModifier.AffineMapping.ToReference
     ref_source1 = FileSource()
     ref_source1.load(reference_file)
     ws_ref.reference = ref_source1
@@ -261,6 +262,7 @@ def analyze_defects(
     logger.info("Running Wigner-Seitz analysis (displaced-atom mode) ...")
     pipeline_disp = ovito_import(displaced_file)
     ws_disp = WignerSeitzAnalysisModifier(output_displaced=True)
+    ws_disp.affine_mapping = ReferenceConfigurationModifier.AffineMapping.ToReference
     ref_source2 = FileSource()
     ref_source2.load(reference_file)
     ws_disp.reference = ref_source2
