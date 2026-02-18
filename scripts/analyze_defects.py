@@ -2,32 +2,35 @@
 """
 Batch defect analysis for cascade simulations.
 
-Processes cascade configurations (indexed by N and M) and runs defect analysis
-using either the OVITO or Cedar backend.  Each cascade has two variants
-analyzed: minimized (``dump.end.min``) and unminimized (``dump.end``).
+Processes one or more cascade datasets and runs defect analysis using either
+the OVITO or Cedar backend.  Each cascade has two variants analyzed: minimized
+(``dump.end.min``) and unminimized (``dump.end``).
 
-The default configuration covers 1000 cascades (N=1–100, M=1–10) from the
-W_Chen19_Jan2026/sc80/50keV/pka1 dataset.
+Datasets can be specified via a YAML configuration file (recommended for
+multi-dataset campaigns) **or** via legacy CLI flags for a single dataset.
 
 Usage::
 
-    # Run with OVITO backend (default)
-    python analyze_defects.py
-
-    # Run with Cedar backend
-    python analyze_defects.py --backend cedar
-
-    # Process a subset with 4 parallel workers and write summary CSV
-    python analyze_defects.py --n-end 10 --m-end 5 --parallel 4 \\
-        --summary-csv results.csv
+    # Multi-dataset mode (recommended)
+    python analyze_defects.py --config datasets.yaml
 
     # Preview what would be done
-    python analyze_defects.py --dry-run
+    python analyze_defects.py --config datasets.yaml --dry-run
+
+    # Single-dataset legacy mode (backward-compatible)
+    python analyze_defects.py --reference dump.ref --base-dir ./pka1
+
+    # Override config-level settings from CLI
+    python analyze_defects.py --config datasets.yaml --backend cedar --parallel 8
 """
 
 import argparse
 import csv
+import json
 import logging
+import math
+import os
+import re
 import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -49,6 +52,339 @@ DEFAULT_OUTPUT_BASE_DIR = (
 
 
 # ---------------------------------------------------------------------------
+# Cascade discovery
+# ---------------------------------------------------------------------------
+
+
+def discover_cascades(base_dir):
+    """
+    Recursively search *base_dir* for cascade dump files.
+
+    A cascade is any directory that contains ``dump.end``.  If the same
+    directory also has ``dump.end.min``, the minimized variant is recorded
+    too.
+
+    Cascades are sorted by their path relative to *base_dir* (using
+    numeric sorting on individual path components where possible) and
+    assigned sequential 1-based integer IDs.
+
+    Parameters
+    ----------
+    base_dir : str or Path
+        Root of the cascade dump tree (e.g. ``…/50keV/pka1``).
+
+    Returns
+    -------
+    list of dict
+        Each dict has:
+        - ``cascade_id``    : int – 1-based sequential identifier.
+        - ``rel_path``      : str – path components relative to base_dir
+                              (e.g. ``"3/7"``).
+        - ``displaced``     : str – absolute path to ``dump.end``.
+        - ``displaced_min`` : str or None – absolute path to
+                              ``dump.end.min`` (None if absent).
+        - ``path_parts``    : list of str – individual directory names
+                              (e.g. ``["3", "7"]``).
+    """
+    base = Path(base_dir).resolve()
+    if not base.is_dir():
+        logger.error("Base directory does not exist: %s", base)
+        return []
+
+    cascades = []
+    for dump_end in sorted(base.rglob("dump.end")):
+        # Skip if dump.end is actually in a deeper sub-dir we don't want
+        cascade_dir = dump_end.parent
+        rel = cascade_dir.relative_to(base)
+        parts = list(rel.parts)
+
+        displaced_min = cascade_dir / "dump.end.min"
+        cascades.append({
+            "rel_path": str(rel),
+            "displaced": str(dump_end),
+            "displaced_min": str(displaced_min) if displaced_min.exists() else None,
+            "path_parts": parts,
+        })
+
+    # Sort using numeric-aware key so "2" < "10"
+    def _sort_key(c):
+        parts = []
+        for p in c["path_parts"]:
+            try:
+                parts.append((0, int(p)))
+            except ValueError:
+                parts.append((1, p))
+        return parts
+
+    cascades.sort(key=_sort_key)
+
+    # Assign deterministic IDs
+    for idx, c in enumerate(cascades, start=1):
+        c["cascade_id"] = idx
+
+    logger.info(
+        "Discovered %d cascades in %s", len(cascades), base_dir
+    )
+    return cascades
+
+
+def _id_format(total):
+    """Return a zero-padded format string for cascade IDs."""
+    width = max(4, len(str(total)))
+    return f"{{:0{width}d}}"
+
+
+# ---------------------------------------------------------------------------
+# LAMMPS input parser
+# ---------------------------------------------------------------------------
+
+
+def parse_lammps_inputs(base_dir):
+    """
+    Search for LAMMPS input files near *base_dir* and extract metadata.
+
+    Looks for ``in.cascade`` in *base_dir* and ``in.therm`` in sibling /
+    grandparent ``therm`` or ``therm_2`` directories.  Falls back to any
+    ``in.*`` file found nearby.
+
+    Parameters
+    ----------
+    base_dir : str or Path
+        Root of the cascade dump tree (the per-energy/pka directory).
+
+    Returns
+    -------
+    dict
+        Extracted metadata (keys with ``None`` values if not found):
+
+        - ``material`` : str  (from pair_coeff element symbols)
+        - ``potential`` : str  (interatomic potential filename)
+        - ``pair_style`` : str
+        - ``temperature_K`` : float
+        - ``pka_energy_eV`` : float
+        - ``timestep_ps`` : float
+        - ``lattice_constant_angstrom`` : float
+        - ``cascade_duration_ps`` : float
+        - ``units`` : str
+        - ``pka_id`` : int
+        - ``n_therm_configs`` : int  (number of thermalized restart files)
+        - ``therm_input_file`` : str  (path found)
+        - ``cascade_input_file`` : str  (path found)
+    """
+    base = Path(base_dir).resolve()
+
+    result = {
+        "material": None,
+        "potential": None,
+        "pair_style": None,
+        "temperature_K": None,
+        "pka_energy_eV": None,
+        "timestep_ps": None,
+        "lattice_constant_angstrom": None,
+        "cascade_duration_ps": None,
+        "units": None,
+        "pka_id": None,
+        "n_therm_configs": None,
+        "therm_input_file": None,
+        "cascade_input_file": None,
+    }
+
+    # --- Locate input files ---
+    cascade_input = base / "in.cascade"
+    if not cascade_input.exists():
+        # Try one level up
+        cascade_input = base.parent / "in.cascade"
+    if cascade_input.exists():
+        result["cascade_input_file"] = str(cascade_input)
+        _parse_cascade_input(cascade_input, result)
+
+    # Search for therm input: look in sibling/grandparent therm dirs
+    therm_input = None
+    for candidate in [
+        base.parent / "therm" / "in.therm",
+        base.parent / "therm_2" / "in.therm",
+        base.parent.parent / "therm" / "in.therm",
+        base.parent.parent / "therm_2" / "in.therm",
+    ]:
+        if candidate.exists():
+            therm_input = candidate
+            break
+
+    if therm_input is not None:
+        result["therm_input_file"] = str(therm_input)
+        _parse_therm_input(therm_input, result)
+
+    return result
+
+
+def _parse_cascade_input(filepath, result):
+    """Parse an in.cascade file and update *result* dict in-place."""
+    try:
+        text = Path(filepath).read_text(errors="replace")
+    except OSError as e:
+        logger.warning("Could not read %s: %s", filepath, e)
+        return
+
+    # units
+    m = re.search(r"^\s*units\s+(\S+)", text, re.MULTILINE)
+    if m:
+        result["units"] = m.group(1)
+
+    # pair_style
+    m = re.search(r"^\s*pair_style\s+(.+)", text, re.MULTILINE)
+    if m:
+        result["pair_style"] = m.group(1).strip()
+
+    # pair_coeff → potential file and element symbols
+    m = re.search(r"^\s*pair_coeff\s+\*\s+\*\s+(\S+)\s+(.*)", text, re.MULTILINE)
+    if m:
+        result["potential"] = Path(m.group(1)).name  # just filename
+        elements = m.group(2).strip().split()
+        if elements:
+            result["material"] = " ".join(elements)
+
+    # PKA energy: variable Ek equal 50*1000.0  →  50000 eV
+    m = re.search(r"^\s*variable\s+Ek\s+equal\s+(.+)", text, re.MULTILINE)
+    if m:
+        try:
+            result["pka_energy_eV"] = float(eval(m.group(1).strip()))
+        except Exception:
+            pass
+
+    # PKA id
+    m = re.search(r"^\s*variable\s+pkaid\s+equal\s+(\d+)", text, re.MULTILINE)
+    if m:
+        result["pka_id"] = int(m.group(1))
+
+    # Cascade duration
+    m = re.search(
+        r"^\s*variable\s+duration\s+equal\s+(\S+)", text, re.MULTILINE
+    )
+    if m:
+        try:
+            result["cascade_duration_ps"] = float(m.group(1))
+        except ValueError:
+            pass
+
+    # timestep
+    m = re.search(r"^\s*timestep\s+(\S+)", text, re.MULTILINE)
+    if m:
+        try:
+            result["timestep_ps"] = float(m.group(1))
+        except ValueError:
+            pass
+
+    # Temperature from variable TEMP
+    m = re.search(r"^\s*variable\s+TEMP\s+equal\s+(\S+)", text, re.MULTILINE)
+    if m:
+        try:
+            result["temperature_K"] = float(m.group(1))
+        except ValueError:
+            pass
+
+    # Lattice constant: variable a0 equal 63.30497/20
+    m = re.search(r"^\s*variable\s+a0\s+equal\s+(.+)", text, re.MULTILINE)
+    if m:
+        try:
+            result["lattice_constant_angstrom"] = float(eval(m.group(1).strip()))
+        except Exception:
+            pass
+
+
+def _parse_therm_input(filepath, result):
+    """Parse an in.therm file and update *result* dict in-place."""
+    try:
+        text = Path(filepath).read_text(errors="replace")
+    except OSError as e:
+        logger.warning("Could not read %s: %s", filepath, e)
+        return
+
+    # Temperature (may already be set by cascade input, therm is fallback)
+    if result.get("temperature_K") is None:
+        m = re.search(
+            r"^\s*variable\s+TEMP\s+equal\s+(\S+)", text, re.MULTILINE
+        )
+        if m:
+            try:
+                result["temperature_K"] = float(m.group(1))
+            except ValueError:
+                pass
+
+    # potential (fallback)
+    if result.get("potential") is None:
+        m = re.search(
+            r"^\s*pair_coeff\s+\*\s+\*\s+(\S+)\s+(.*)", text, re.MULTILINE
+        )
+        if m:
+            result["potential"] = Path(m.group(1)).name
+            elements = m.group(2).strip().split()
+            if elements and result.get("material") is None:
+                result["material"] = " ".join(elements)
+
+    # Number of thermalization configs: variable i loop 1 N
+    m = re.search(r"^\s*variable\s+\w+\s+loop\s+\d+\s+(\d+)", text, re.MULTILINE)
+    if m:
+        result["n_therm_configs"] = int(m.group(1))
+
+
+# ---------------------------------------------------------------------------
+# YAML config loader
+# ---------------------------------------------------------------------------
+
+
+def load_config(config_path):
+    """
+    Load and validate a YAML dataset configuration file.
+
+    Parameters
+    ----------
+    config_path : str or Path
+        Path to the YAML file.
+
+    Returns
+    -------
+    dict
+        Full config with ``"datasets"`` list and optional global settings.
+
+    Raises
+    ------
+    SystemExit
+        On validation errors.
+    """
+    try:
+        import yaml
+    except ImportError:
+        logger.error(
+            "PyYAML is required for --config mode.  "
+            "Install it with: python -m pip install pyyaml"
+        )
+        sys.exit(1)
+
+    config_path = Path(config_path)
+    if not config_path.exists():
+        logger.error("Config file not found: %s", config_path)
+        sys.exit(1)
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    if not isinstance(config, dict) or "datasets" not in config:
+        logger.error("Config file must contain a 'datasets' key.")
+        sys.exit(1)
+
+    required_keys = {"name", "reference", "base_dir", "output_dir"}
+    for i, ds in enumerate(config["datasets"]):
+        missing = required_keys - set(ds.keys())
+        if missing:
+            logger.error(
+                "Dataset #%d is missing required keys: %s", i + 1, missing
+            )
+            sys.exit(1)
+
+    return config
+
+
+# ---------------------------------------------------------------------------
 # Backend adapters
 # ---------------------------------------------------------------------------
 # Each adapter takes the same arguments and returns a dict with at minimum:
@@ -59,7 +395,7 @@ DEFAULT_OUTPUT_BASE_DIR = (
 #   "error": str or None
 
 
-def _run_ovito(reference, displaced, output_dir):
+def _run_ovito(reference, displaced, output_dir, output_prefix=""):
     """Run OVITO Wigner-Seitz defect analysis on a single cascade."""
     from ovito_defect_analysis import analyze_defects
 
@@ -78,6 +414,7 @@ def _run_ovito(reference, displaced, output_dir):
             reference_file=str(reference),
             displaced_file=str(displaced),
             output_dir=str(output_dir),
+            output_prefix=output_prefix,
             write_dump_files=True,
             return_data=False,
         )
@@ -98,16 +435,40 @@ def _run_ovito(reference, displaced, output_dir):
         }
 
 
-def _run_cedar(reference, displaced, output_dir, cedar_executable=None):
-    """Run Cedar defect analysis on a single cascade."""
+def _run_cedar(reference, displaced, output_dir, output_prefix="",
+               cedar_executable=None):
+    """Run Cedar defect analysis on a single cascade.
+
+    Cedar always writes ``vac.dump``, ``sia.dump``, ``sia_site.dump`` into
+    its working directory.  After completion, the files are renamed to
+    include the *output_prefix* so they sit in the flat output layout.
+    """
+    import shutil
+    import tempfile
+
     from cedar_defect_analysis import cedar_defect_analysis
 
-    return cedar_defect_analysis(
-        reference_dump=str(reference),
-        displaced_dump=str(displaced),
-        output_dir=str(output_dir),
-        cedar_executable=cedar_executable,
-    )
+    # Run cedar in a temporary sub-directory to avoid collisions
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(dir=str(output_dir)) as tmpdir:
+        result = cedar_defect_analysis(
+            reference_dump=str(reference),
+            displaced_dump=str(displaced),
+            output_dir=tmpdir,
+            cedar_executable=cedar_executable,
+        )
+
+        if result["success"]:
+            # Move and rename output files
+            for base_name in ("vac.dump", "sia.dump", "sia_site.dump"):
+                src = Path(tmpdir) / base_name
+                if src.exists():
+                    dst = output_dir / f"{output_prefix}{base_name}"
+                    shutil.move(str(src), str(dst))
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -115,14 +476,16 @@ def _run_cedar(reference, displaced, output_dir, cedar_executable=None):
 # ---------------------------------------------------------------------------
 
 
-def _worker_ovito(reference, displaced, output_dir):
+def _worker_ovito(reference, displaced, output_dir, output_prefix):
     """Top-level worker for OVITO backend (must be picklable)."""
-    return _run_ovito(reference, displaced, output_dir)
+    return _run_ovito(reference, displaced, output_dir, output_prefix)
 
 
-def _worker_cedar(reference, displaced, output_dir, cedar_executable):
+def _worker_cedar(reference, displaced, output_dir, output_prefix,
+                  cedar_executable):
     """Top-level worker for Cedar backend (must be picklable)."""
-    return _run_cedar(reference, displaced, output_dir, cedar_executable)
+    return _run_cedar(reference, displaced, output_dir, output_prefix,
+                      cedar_executable)
 
 
 # ---------------------------------------------------------------------------
@@ -130,37 +493,54 @@ def _worker_cedar(reference, displaced, output_dir, cedar_executable):
 # ---------------------------------------------------------------------------
 
 
-def _build_tasks(args):
+def build_tasks(cascades, dataset_cfg, id_fmt=None):
     """
-    Generate the list of (n, m, state, displaced_path, output_dir) tasks.
+    Generate analysis tasks from discovered cascades.
+
+    Parameters
+    ----------
+    cascades : list of dict
+        Output of :func:`discover_cascades`.
+    dataset_cfg : dict
+        Dataset configuration dict (must have ``output_dir``, ``reference``).
+    id_fmt : str or None
+        Format string for cascade IDs (e.g. ``"{:04d}"``).  Computed
+        automatically if *None*.
 
     Returns
     -------
     list of dict
-        Each dict has: n, m, state, displaced, output_dir.
+        Each dict has: cascade_id, rel_path, state, displaced, output_dir,
+        output_prefix.
     """
+    if id_fmt is None:
+        id_fmt = _id_format(len(cascades))
+    output_dir = dataset_cfg["output_dir"]
+
     tasks = []
-    for n in range(args.n_start, args.n_end + 1):
-        for m in range(args.m_start, args.m_end + 1):
-            base_dir = Path(args.base_dir) / str(n) / str(m)
-            output_base = Path(args.output_dir) / str(n) / str(m)
+    for cascade in cascades:
+        cid = cascade["cascade_id"]
+        cid_str = id_fmt.format(cid)
 
-            # Minimized
+        # Unminimized
+        tasks.append({
+            "cascade_id": cid,
+            "rel_path": cascade["rel_path"],
+            "state": "unminimized",
+            "displaced": cascade["displaced"],
+            "output_dir": output_dir,
+            "output_prefix": f"{cid_str}_",
+        })
+
+        # Minimized (if available)
+        if cascade["displaced_min"] is not None:
             tasks.append({
-                "n": n,
-                "m": m,
+                "cascade_id": cid,
+                "rel_path": cascade["rel_path"],
                 "state": "minimized",
-                "displaced": str(base_dir / "dump.end.min"),
-                "output_dir": str(output_base / "minimized"),
-            })
-
-            # Unminimized
-            tasks.append({
-                "n": n,
-                "m": m,
-                "state": "unminimized",
-                "displaced": str(base_dir / "dump.end"),
-                "output_dir": str(output_base / "unminimized"),
+                "displaced": cascade["displaced_min"],
+                "output_dir": output_dir,
+                "output_prefix": f"{cid_str}_min_",
             })
 
     return tasks
@@ -171,7 +551,307 @@ def _should_skip(task, skip_existing):
     if not skip_existing:
         return False
     out_dir = Path(task["output_dir"])
-    return (out_dir / "vac.dump").exists()
+    return (out_dir / f"{task['output_prefix']}vac.dump").exists()
+
+
+# ---------------------------------------------------------------------------
+# Task execution
+# ---------------------------------------------------------------------------
+
+
+def run_tasks(tasks, backend, parallel, reference, cedar_executable=None,
+              skip_existing=False):
+    """
+    Execute a list of analysis tasks and return results.
+
+    Parameters
+    ----------
+    tasks : list of dict
+        Tasks from :func:`build_tasks`.
+    backend : str
+        ``"ovito"`` or ``"cedar"``.
+    parallel : int
+        Number of workers.
+    reference : str
+        Path to reference dump file.
+    cedar_executable : str or None
+        Path to cedar binary (Cedar backend only).
+    skip_existing : bool
+        Whether to skip tasks whose output already exists.
+
+    Returns
+    -------
+    list of dict
+        One result dict per task with keys: cascade_id, rel_path, state,
+        n_vacancies, n_sias, n_sia_sites, success, error, output_files.
+    """
+    total = len(tasks)
+    processed = 0
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    results_log = []
+
+    start_time = datetime.now()
+
+    if backend == "ovito":
+        ExecutorClass = ProcessPoolExecutor
+    else:
+        ExecutorClass = ThreadPoolExecutor
+
+    with ExecutorClass(max_workers=parallel) as executor:
+        future_to_task = {}
+
+        for task in tasks:
+            if _should_skip(task, skip_existing):
+                skipped_count += 1
+                processed += 1
+                results_log.append({
+                    "cascade_id": task["cascade_id"],
+                    "rel_path": task["rel_path"],
+                    "state": task["state"],
+                    "n_vacancies": None,
+                    "n_sias": None,
+                    "n_sia_sites": None,
+                    "success": "skipped",
+                    "error": "",
+                    "output_files": [],
+                })
+                continue
+
+            if backend == "ovito":
+                future = executor.submit(
+                    _worker_ovito,
+                    reference,
+                    task["displaced"],
+                    task["output_dir"],
+                    task["output_prefix"],
+                )
+            else:
+                future = executor.submit(
+                    _worker_cedar,
+                    reference,
+                    task["displaced"],
+                    task["output_dir"],
+                    task["output_prefix"],
+                    cedar_executable,
+                )
+
+            future_to_task[future] = task
+
+        submitted = len(future_to_task)
+        completed = 0
+
+        for future in as_completed(future_to_task):
+            task = future_to_task[future]
+            completed += 1
+            processed += 1
+
+            try:
+                result = future.result()
+            except Exception as e:
+                result = {
+                    "success": False,
+                    "n_vacancies": None,
+                    "n_sias": None,
+                    "n_sia_sites": None,
+                    "error": f"Worker exception: {e}",
+                }
+
+            if result["success"]:
+                success_count += 1
+            else:
+                failed_count += 1
+
+            # Build output file list
+            prefix = task["output_prefix"]
+            output_files = []
+            if result["success"]:
+                for name in ("vac.dump", "sia.dump", "sia_site.dump"):
+                    output_files.append(f"{prefix}{name}")
+
+            results_log.append({
+                "cascade_id": task["cascade_id"],
+                "rel_path": task["rel_path"],
+                "state": task["state"],
+                "n_vacancies": result.get("n_vacancies"),
+                "n_sias": result.get("n_sias"),
+                "n_sia_sites": result.get("n_sia_sites"),
+                "success": result["success"],
+                "error": result.get("error", "") or "",
+                "output_files": output_files,
+            })
+
+            # Progress
+            elapsed = (datetime.now() - start_time).total_seconds() / 60
+            rate = completed / elapsed if elapsed > 0 else 0
+            remaining = submitted - completed
+            eta = remaining / rate if rate > 0 else 0
+
+            status_parts = [
+                f"Progress: {processed}/{total} "
+                f"({100 * processed / total:.1f}%)",
+                f"OK: {success_count}",
+                f"Fail: {failed_count}",
+            ]
+            if skipped_count > 0:
+                status_parts.append(f"Skip: {skipped_count}")
+            status_parts.append(f"Rate: {rate:.1f}/min")
+            status_parts.append(f"ETA: {eta:.1f} min")
+
+            cid = task["cascade_id"]
+            if result["success"]:
+                detail = ""
+                if result.get("n_vacancies") is not None:
+                    detail = (
+                        f" [vac={result['n_vacancies']}, "
+                        f"sia={result['n_sias']}]"
+                    )
+                print(
+                    f"  OK   #{cid:>4d} ({task['rel_path']}) "
+                    f"{task['state']:<12s}{detail}  |  "
+                    + " - ".join(status_parts)
+                )
+            else:
+                print(
+                    f"  FAIL #{cid:>4d} ({task['rel_path']}) "
+                    f"{task['state']:<12s}  |  "
+                    + " - ".join(status_parts)
+                )
+                logger.warning(
+                    "  Error: %s", result.get("error", "unknown")
+                )
+
+    return results_log
+
+
+# ---------------------------------------------------------------------------
+# Metadata writer
+# ---------------------------------------------------------------------------
+
+
+def write_metadata(output_dir, dataset_cfg, sim_metadata, cascades,
+                   results_log, backend, start_time, end_time):
+    """
+    Write ``metadata.json`` summarising a dataset's analysis.
+
+    Parameters
+    ----------
+    output_dir : str or Path
+        Dataset output directory.
+    dataset_cfg : dict
+        Original dataset configuration.
+    sim_metadata : dict
+        Parsed LAMMPS metadata from :func:`parse_lammps_inputs`.
+    cascades : list of dict
+        Discovered cascades from :func:`discover_cascades`.
+    results_log : list of dict
+        Per-task results from :func:`run_tasks`.
+    backend : str
+        Backend name.
+    start_time, end_time : datetime
+        Wall-clock times.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Group results by cascade_id
+    results_by_cascade = {}
+    for r in results_log:
+        cid = r["cascade_id"]
+        results_by_cascade.setdefault(cid, {})[r["state"]] = r
+
+    cascade_records = []
+    for cascade in cascades:
+        cid = cascade["cascade_id"]
+        states = {}
+        for state_name in ("minimized", "unminimized"):
+            r = results_by_cascade.get(cid, {}).get(state_name)
+            if r is not None:
+                states[state_name] = {
+                    "source_file": Path(
+                        cascade.get(
+                            "displaced_min" if state_name == "minimized"
+                            else "displaced", ""
+                        ) or ""
+                    ).name,
+                    "n_vacancies": r.get("n_vacancies"),
+                    "n_sias": r.get("n_sias"),
+                    "n_sia_sites": r.get("n_sia_sites"),
+                    "success": r["success"],
+                    "error": r.get("error", "") or None,
+                    "output_files": r.get("output_files", []),
+                }
+        cascade_records.append({
+            "cascade_id": cid,
+            "source_path": cascade["rel_path"],
+            "states": states,
+        })
+
+    # Counts
+    ok = sum(1 for r in results_log if r["success"] is True)
+    fail = sum(1 for r in results_log if r["success"] is False)
+    skip = sum(1 for r in results_log if r["success"] == "skipped")
+
+    # Merge explicit overrides into sim_metadata
+    sim_info = {k: v for k, v in sim_metadata.items() if v is not None}
+    for key in ("pka_energy_keV", "supercell", "material",
+                "temperature_K", "potential"):
+        if key in dataset_cfg and dataset_cfg[key] is not None:
+            sim_info[key] = dataset_cfg[key]
+
+    metadata = {
+        "dataset_name": dataset_cfg["name"],
+        "created": end_time.isoformat(),
+        "backend": backend,
+        "reference_file": str(dataset_cfg["reference"]),
+        "base_dir": str(dataset_cfg["base_dir"]),
+        "simulation_metadata": sim_info,
+        "n_cascades": len(cascades),
+        "cascades": cascade_records,
+        "summary": {
+            "total_tasks": len(results_log),
+            "successful": ok,
+            "failed": fail,
+            "skipped": skip,
+            "wall_time_seconds": (end_time - start_time).total_seconds(),
+        },
+    }
+
+    meta_path = output_dir / "metadata.json"
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2, default=str)
+
+    logger.info("Metadata written to %s", meta_path)
+    return meta_path
+
+
+# ---------------------------------------------------------------------------
+# Summary CSV (optional, backward-compatible)
+# ---------------------------------------------------------------------------
+
+
+def write_summary_csv(csv_path, all_results):
+    """Write a combined summary CSV from results across all datasets."""
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    all_results.sort(
+        key=lambda r: (r.get("dataset", ""), r["cascade_id"], r["state"])
+    )
+
+    fieldnames = [
+        "dataset", "cascade_id", "rel_path", "state",
+        "n_vacancies", "n_sias", "n_sia_sites", "success", "error",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=fieldnames, extrasaction="ignore"
+        )
+        writer.writeheader()
+        writer.writerows(all_results)
+
+    print(f"\nSummary CSV written to: {csv_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -184,15 +864,32 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Batch defect analysis for cascade simulations.  "
-            "Supports OVITO (open-source) and Cedar backends."
+            "Supports OVITO (open-source) and Cedar backends.  "
+            "Use --config with a YAML file for multi-dataset campaigns."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  %(prog)s --backend ovito --parallel 4\n"
-            "  %(prog)s --backend cedar --n-end 10 --m-end 5\n"
-            "  %(prog)s --dry-run\n"
-            "  %(prog)s --summary-csv results.csv --skip-existing\n"
+            "  # Multi-dataset mode\n"
+            "  %(prog)s --config datasets.yaml\n"
+            "  %(prog)s --config datasets.yaml --backend cedar --parallel 8\n"
+            "\n"
+            "  # Single-dataset legacy mode\n"
+            "  %(prog)s --reference dump.ref --base-dir ./pka1 "
+            "--output-dir ./out\n"
+            "\n"
+            "  # Preview\n"
+            "  %(prog)s --config datasets.yaml --dry-run\n"
+        ),
+    )
+
+    # Config file
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to YAML config listing datasets.  When provided, "
+            "--reference/--base-dir/--output-dir are ignored."
         ),
     )
 
@@ -200,25 +897,25 @@ def main(argv=None):
     parser.add_argument(
         "--backend",
         choices=["ovito", "cedar"],
-        default="ovito",
+        default=None,
         help="Defect analysis backend (default: ovito).",
     )
 
-    # Paths
+    # Paths (legacy single-dataset mode)
     parser.add_argument(
         "--reference",
         default=DEFAULT_REFERENCE_FILE,
-        help=f"Path to reference dump file (default: {DEFAULT_REFERENCE_FILE}).",
+        help="Path to reference dump file (single-dataset mode).",
     )
     parser.add_argument(
         "--base-dir",
         default=DEFAULT_BASE_DUMP_DIR,
-        help=f"Root of the cascade dump directory tree (default: {DEFAULT_BASE_DUMP_DIR}).",
+        help="Root of cascade dump directory tree (single-dataset mode).",
     )
     parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_BASE_DIR,
-        help=f"Root of the output directory tree (default: {DEFAULT_OUTPUT_BASE_DIR}).",
+        help="Root of output directory tree (single-dataset mode).",
     )
     parser.add_argument(
         "--cedar-executable",
@@ -229,37 +926,11 @@ def main(argv=None):
         ),
     )
 
-    # Range of configurations
-    parser.add_argument(
-        "--n-start",
-        type=int,
-        default=1,
-        help="Starting N value (default: 1).",
-    )
-    parser.add_argument(
-        "--n-end",
-        type=int,
-        default=100,
-        help="Ending N value (default: 100).",
-    )
-    parser.add_argument(
-        "--m-start",
-        type=int,
-        default=1,
-        help="Starting M value (default: 1).",
-    )
-    parser.add_argument(
-        "--m-end",
-        type=int,
-        default=10,
-        help="Ending M value (default: 10).",
-    )
-
     # Execution options
     parser.add_argument(
         "--parallel",
         type=int,
-        default=1,
+        default=None,
         help="Number of parallel workers (default: 1).",
     )
     parser.add_argument(
@@ -270,7 +941,8 @@ def main(argv=None):
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip cascades whose output directory already has vac.dump.",
+        default=None,
+        help="Skip cascades whose output already exists.",
     )
 
     # Output options
@@ -301,218 +973,161 @@ def main(argv=None):
         datefmt="%H:%M:%S",
     )
 
-    # Validate cedar prerequisites if needed
-    if args.backend == "cedar" and not args.dry_run:
+    # ---------------------------------------------------------------
+    # Build dataset list (from config or from CLI flags)
+    # ---------------------------------------------------------------
+    if args.config:
+        config = load_config(args.config)
+        datasets = config["datasets"]
+        # Apply config-level defaults, then CLI overrides
+        cfg_backend = config.get("backend", "ovito")
+        cfg_parallel = config.get("parallel", 1)
+        cfg_skip = config.get("skip_existing", False)
+    else:
+        # Legacy: single-dataset from CLI flags
+        datasets = [
+            {
+                "name": Path(args.output_dir).name,
+                "reference": args.reference,
+                "base_dir": args.base_dir,
+                "output_dir": args.output_dir,
+            }
+        ]
+        cfg_backend = "ovito"
+        cfg_parallel = 1
+        cfg_skip = False
+
+    # CLI overrides take precedence
+    backend = args.backend or cfg_backend
+    parallel = args.parallel if args.parallel is not None else cfg_parallel
+    skip_existing = (
+        args.skip_existing if args.skip_existing is not None else cfg_skip
+    )
+
+    # Validate cedar prerequisites once
+    if backend == "cedar" and not args.dry_run:
         from cedar_defect_analysis import check_cedar_prerequisites
+
         if not check_cedar_prerequisites(args.cedar_executable):
             return 1
 
-    # Validate reference file
-    if not args.dry_run:
-        ref_path = Path(args.reference)
-        if not ref_path.exists():
-            logger.error("Reference file not found: %s", ref_path)
-            return 1
+    # ---------------------------------------------------------------
+    # Process each dataset
+    # ---------------------------------------------------------------
+    all_start = datetime.now()
+    all_results = []
+    any_failed = False
 
-    # Build task list
-    tasks = _build_tasks(args)
-    total = len(tasks)
+    print(f"{'=' * 80}")
+    print(f"Batch defect analysis — {len(datasets)} dataset(s)")
+    print(f"Backend: {backend}  |  Workers: {parallel}  "
+          f"|  Skip existing: {skip_existing}")
+    print(f"{'=' * 80}")
 
-    # Statistics
-    processed = 0
-    success = 0
-    failed = 0
-    skipped = 0
-    results_log = []  # For summary CSV
+    for ds_idx, ds in enumerate(datasets, start=1):
+        ds_start = datetime.now()
+        name = ds["name"]
+        reference = ds["reference"]
+        base_dir = ds["base_dir"]
+        output_dir = ds["output_dir"]
 
-    start_time = datetime.now()
+        print(f"\n{'─' * 80}")
+        print(f"Dataset {ds_idx}/{len(datasets)}: {name}")
+        print(f"  Reference : {reference}")
+        print(f"  Input dir : {base_dir}")
+        print(f"  Output dir: {output_dir}")
 
-    print(f"Starting batch defect analysis at {start_time}")
-    print(f"Backend: {args.backend}")
-    print(f"Configurations: {total} tasks "
-          f"(N={args.n_start}-{args.n_end}, M={args.m_start}-{args.m_end}, "
-          f"x2 states)")
-    print(f"Reference: {args.reference}")
-    print(f"Input dir: {args.base_dir}")
-    print(f"Output dir: {args.output_dir}")
-    if args.backend == "cedar":
-        print(f"Cedar executable: {args.cedar_executable}")
-    print(f"Parallel workers: {args.parallel}")
-    if args.skip_existing:
-        print("Skipping existing results")
-    print("-" * 80)
+        # Validate reference
+        if not args.dry_run and not Path(reference).exists():
+            logger.error("Reference file not found: %s", reference)
+            any_failed = True
+            continue
 
-    if args.dry_run:
-        for task in tasks:
-            skip = _should_skip(task, args.skip_existing)
-            status = "[SKIP]" if skip else "[DRY RUN]"
-            print(f"  {status} N={task['n']}, M={task['m']}, "
-                  f"state={task['state']}")
-            print(f"    Displaced: {task['displaced']}")
-            print(f"    Output:    {task['output_dir']}")
-            if skip:
-                skipped += 1
-            else:
-                success += 1
-            processed += 1
-        print(f"\n{processed} tasks total, {skipped} would be skipped")
-        return 0
+        # Discover cascades
+        cascades = discover_cascades(base_dir)
+        if not cascades:
+            logger.warning("No cascades found in %s — skipping.", base_dir)
+            continue
 
-    # Select executor type based on backend:
-    #   - OVITO: ProcessPoolExecutor (required per OVITO docs)
-    #   - Cedar: ThreadPoolExecutor  (subprocess-based, threads are fine)
-    if args.backend == "ovito":
-        ExecutorClass = ProcessPoolExecutor
-    else:
-        ExecutorClass = ThreadPoolExecutor
+        # Parse LAMMPS metadata
+        sim_metadata = parse_lammps_inputs(base_dir)
+        logger.debug("Parsed metadata: %s", sim_metadata)
 
-    # Submit and process tasks
-    with ExecutorClass(max_workers=args.parallel) as executor:
-        future_to_task = {}
+        # Build tasks
+        tasks = build_tasks(cascades, ds)
+        total_tasks = len(tasks)
+        print(f"  Cascades  : {len(cascades)} "
+              f"({total_tasks} tasks including min/unmin variants)")
+        print(f"{'─' * 80}")
 
-        for task in tasks:
-            # Check skip
-            if _should_skip(task, args.skip_existing):
-                skipped += 1
-                processed += 1
-                results_log.append({
-                    "n": task["n"],
-                    "m": task["m"],
-                    "state": task["state"],
-                    "n_vacancies": "",
-                    "n_sias": "",
-                    "n_sia_sites": "",
-                    "success": "skipped",
-                    "error": "",
-                })
-                continue
-
-            # Submit to executor
-            if args.backend == "ovito":
-                future = executor.submit(
-                    _worker_ovito,
-                    args.reference,
-                    task["displaced"],
-                    task["output_dir"],
-                )
-            else:
-                future = executor.submit(
-                    _worker_cedar,
-                    args.reference,
-                    task["displaced"],
-                    task["output_dir"],
-                    args.cedar_executable,
-                )
-
-            future_to_task[future] = task
-
-        # Collect results
-        submitted = len(future_to_task)
-        completed = 0
-
-        for future in as_completed(future_to_task):
-            task = future_to_task[future]
-            completed += 1
-            processed += 1
-
-            try:
-                result = future.result()
-            except Exception as e:
-                result = {
-                    "success": False,
-                    "n_vacancies": None,
-                    "n_sias": None,
-                    "n_sia_sites": None,
-                    "error": f"Worker exception: {e}",
-                }
-
-            if result["success"]:
-                success += 1
-            else:
-                failed += 1
-
-            # Log for CSV
-            results_log.append({
-                "n": task["n"],
-                "m": task["m"],
-                "state": task["state"],
-                "n_vacancies": result.get("n_vacancies", ""),
-                "n_sias": result.get("n_sias", ""),
-                "n_sia_sites": result.get("n_sia_sites", ""),
-                "success": result["success"],
-                "error": result.get("error", "") or "",
-            })
-
-            # Progress
-            elapsed = (datetime.now() - start_time).total_seconds() / 60
-            rate = completed / elapsed if elapsed > 0 else 0
-            remaining = submitted - completed
-            eta = remaining / rate if rate > 0 else 0
-
-            status_parts = [
-                f"Progress: {processed}/{total} ({100 * processed / total:.1f}%)",
-                f"Success: {success}",
-                f"Failed: {failed}",
-            ]
-            if skipped > 0:
-                status_parts.append(f"Skipped: {skipped}")
-            status_parts.append(f"Rate: {rate:.1f}/min")
-            status_parts.append(f"ETA: {eta:.1f} min")
-
-            if result["success"]:
-                detail = ""
-                if result.get("n_vacancies") is not None:
-                    detail = (
-                        f" [vac={result['n_vacancies']}, "
-                        f"sia={result['n_sias']}]"
-                    )
+        if args.dry_run:
+            id_fmt = _id_format(len(cascades))
+            for task in tasks:
+                skip = _should_skip(task, skip_existing)
+                status = "[SKIP]" if skip else "[DRY RUN]"
                 print(
-                    f"  OK  N={task['n']:>3d} M={task['m']:>2d} "
-                    f"{task['state']:<12s}{detail}  |  "
-                    + " - ".join(status_parts)
+                    f"  {status} #{task['cascade_id']:{len(str(len(cascades)))}d}"
+                    f" ({task['rel_path']})  {task['state']:<12s}"
+                    f"  →  {task['output_prefix']}vac.dump"
                 )
-            else:
-                print(
-                    f"  FAIL N={task['n']:>3d} M={task['m']:>2d} "
-                    f"{task['state']:<12s}  |  "
-                    + " - ".join(status_parts)
-                )
-                logger.warning(
-                    "  Error: %s", result.get("error", "unknown")
-                )
+            continue
 
-    # Write summary CSV
-    if args.summary_csv and results_log:
-        csv_path = Path(args.summary_csv)
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        # Run analysis
+        results_log = run_tasks(
+            tasks,
+            backend=backend,
+            parallel=parallel,
+            reference=reference,
+            cedar_executable=args.cedar_executable,
+            skip_existing=skip_existing,
+        )
 
-        # Sort by n, m, state for consistent output
-        results_log.sort(key=lambda r: (r["n"], r["m"], r["state"]))
+        # Tag results with dataset name
+        for r in results_log:
+            r["dataset"] = name
+        all_results.extend(results_log)
 
-        fieldnames = [
-            "n", "m", "state", "n_vacancies", "n_sias", "n_sia_sites",
-            "success", "error",
-        ]
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results_log)
+        # Write metadata.json
+        ds_end = datetime.now()
+        meta_path = write_metadata(
+            output_dir, ds, sim_metadata, cascades,
+            results_log, backend, ds_start, ds_end,
+        )
 
-        print(f"\nSummary CSV written to: {csv_path}")
+        ds_duration = (ds_end - ds_start).total_seconds()
+        ok = sum(1 for r in results_log if r["success"] is True)
+        fail = sum(1 for r in results_log if r["success"] is False)
+        skip_n = sum(1 for r in results_log if r["success"] == "skipped")
+        print(f"\n  {name} done in {ds_duration / 60:.1f} min — "
+              f"OK: {ok}  Failed: {fail}  Skipped: {skip_n}")
+        print(f"  Metadata: {meta_path}")
 
-    # Final summary
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
+        if fail > 0:
+            any_failed = True
 
-    print("-" * 80)
-    print(f"Analysis complete at {end_time}")
-    print(f"Total time: {duration / 60:.1f} minutes")
-    print(f"Processed: {processed}/{total}")
-    print(f"  Success:  {success}")
-    print(f"  Failed:   {failed}")
-    print(f"  Skipped:  {skipped}")
+    # ---------------------------------------------------------------
+    # Global summary
+    # ---------------------------------------------------------------
+    if args.summary_csv and all_results:
+        write_summary_csv(args.summary_csv, all_results)
 
-    if failed > 0:
+    all_end = datetime.now()
+    total_duration = (all_end - all_start).total_seconds()
+
+    print(f"\n{'=' * 80}")
+    print(f"All datasets complete in {total_duration / 60:.1f} minutes")
+    if all_results:
+        total_ok = sum(1 for r in all_results if r["success"] is True)
+        total_fail = sum(1 for r in all_results if r["success"] is False)
+        total_skip = sum(
+            1 for r in all_results if r["success"] == "skipped"
+        )
+        print(f"  Total tasks: {len(all_results)}")
+        print(f"  Success: {total_ok}  Failed: {total_fail}  "
+              f"Skipped: {total_skip}")
+    print(f"{'=' * 80}")
+
+    if any_failed:
         return 1
     return 0
 

@@ -1,0 +1,33 @@
+# Dataset configuration for W cascade defect analysis
+# W_Chen19_Jan2026 simulation campaign
+#
+# Three datasets at 20, 50, and 100 keV PKA energies.
+# - 20 and 50 keV share the sc80 supercell and reference lattice.
+# - 100 keV uses the larger sc120 supercell.
+
+backend: ovito
+parallel: 20
+skip_existing: true
+
+datasets:
+
+  - name: 20keV
+    reference: /flare/Cascaide/knight/lammps/W_Chen19_Jan2026/sc80/therm/dump.ref
+    base_dir:  /flare/Cascaide/knight/lammps/W_Chen19_Jan2026/sc80/20keV/pka1
+    output_dir: /flare/Cascaide/romano/defect_analysis/20keV
+    pka_energy_keV: 20
+    supercell: sc80
+
+  - name: 50keV
+    reference: /flare/Cascaide/knight/lammps/W_Chen19_Jan2026/sc80/therm/dump.ref
+    base_dir:  /flare/Cascaide/knight/lammps/W_Chen19_Jan2026/sc80/50keV/pka1
+    output_dir: /flare/Cascaide/romano/defect_analysis/50keV
+    pka_energy_keV: 50
+    supercell: sc80
+
+  - name: 100keV
+    reference: /flare/Cascaide/knight/lammps/W_Chen19_Jan2026/sc120/therm/dump.ref
+    base_dir:  /flare/Cascaide/knight/lammps/W_Chen19_Jan2026/sc120/100keV/pka1
+    output_dir: /flare/Cascaide/romano/defect_analysis/100keV
+    pka_energy_keV: 100
+    supercell: sc120
