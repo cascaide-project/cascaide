@@ -82,9 +82,17 @@ def discover_cascades(base_dir):
         - ``cascade_id``    : int – 1-based sequential identifier.
         - ``rel_path``      : str – path components relative to base_dir
                               (e.g. ``"3/7"``).
-        - ``displaced``     : str – absolute path to ``dump.end``.
-        - ``displaced_min`` : str or None – absolute path to
-                              ``dump.end.min`` (None if absent).
+        - ``displaced``     : str – absolute path to ``dump.end`` (or
+                              ``dump.end.gz``).
+        - ``displaced_min`` : str or None – absolute path to the minimized
+                              dump (``dump.end.min`` / ``dump.end.min.gz``,
+                              or None if absent).
+        - ``log_file``      : str or None – absolute path to
+                              ``log.lammps`` in the cascade directory
+                              (None if absent).
+        - ``pka_energy_eV`` : float or None – PKA kinetic energy in eV
+                              parsed from ``log.lammps`` (None if the log
+                              is absent or the value cannot be found).
         - ``path_parts``    : list of str – individual directory names
                               (e.g. ``["3", "7"]``).
     """
@@ -113,10 +121,19 @@ def discover_cascades(base_dir):
             displaced_min_gz = cascade_dir / "dump.end.min.gz"
             displaced_min = displaced_min_gz if displaced_min_gz.exists() else None
 
+        log_file = cascade_dir / "log.lammps"
+        pka_energy_eV = None
+        if log_file.exists():
+            pka_energy_eV = parse_pka_energy_from_log(log_file)
+        else:
+            log_file = None
+
         cascades.append({
             "rel_path": str(rel),
             "displaced": str(dump_end),
             "displaced_min": str(displaced_min) if displaced_min is not None else None,
+            "log_file": str(log_file) if log_file is not None else None,
+            "pka_energy_eV": pka_energy_eV,
             "path_parts": parts,
         })
 
@@ -341,6 +358,63 @@ def _parse_therm_input(filepath, result):
         result["n_therm_configs"] = int(m.group(1))
 
 
+def parse_pka_energy_from_log(log_path):
+    """
+    Extract the PKA kinetic energy (eV) from a LAMMPS ``log.lammps`` file.
+
+    LAMMPS logs the resolved energy via a ``print`` statement of the form::
+
+        PKAid 45919 Energy 5793.36
+
+    As a fallback the last resolved ``variable Ek equal`` line is used::
+
+        variable Ek equal 5.793360*1000.0
+
+    Parameters
+    ----------
+    log_path : str or Path
+        Path to the LAMMPS log file.
+
+    Returns
+    -------
+    float or None
+        PKA kinetic energy in eV, or ``None`` if not found / unreadable.
+    """
+    try:
+        text = Path(log_path).read_text(errors="replace")
+    except OSError as e:
+        logger.warning("Could not read log file %s: %s", log_path, e)
+        return None
+
+    # Primary: explicit print line "PKAid <id> Energy <eV>"
+    m = re.search(r"^PKAid\s+\d+\s+Energy\s+(\S+)", text, re.MULTILINE)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+
+    # Fallback: last resolved "variable Ek equal <expr>" line.
+    # LAMMPS echoes both the template form (${my_pka}*1000.0) and the
+    # expanded form (5.793360*1000.0); take the last match so we get the
+    # numeric expression rather than the template.
+    matches = re.findall(
+        r"^\s*variable\s+Ek\s+equal\s+(.+)", text, re.MULTILINE
+    )
+    for expr in reversed(matches):
+        expr = expr.strip()
+        # Skip template expressions that still contain variable references
+        if "$" in expr or "{" in expr:
+            continue
+        try:
+            return float(eval(expr))  # noqa: S307 — log files are local/trusted
+        except Exception:
+            continue
+
+    logger.warning("Could not find PKA energy in log file: %s", log_path)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # YAML config loader
 # ---------------------------------------------------------------------------
@@ -536,6 +610,8 @@ def build_tasks(cascades, dataset_cfg, id_fmt=None):
         cid = cascade["cascade_id"]
         cid_str = id_fmt.format(cid)
 
+        pka_energy_eV = cascade.get("pka_energy_eV")
+
         # Unminimized
         tasks.append({
             "cascade_id": cid,
@@ -544,6 +620,7 @@ def build_tasks(cascades, dataset_cfg, id_fmt=None):
             "displaced": cascade["displaced"],
             "output_dir": output_dir,
             "output_prefix": f"{cid_str}_",
+            "pka_energy_eV": pka_energy_eV,
         })
 
         # Minimized (if available)
@@ -555,6 +632,7 @@ def build_tasks(cascades, dataset_cfg, id_fmt=None):
                 "displaced": cascade["displaced_min"],
                 "output_dir": output_dir,
                 "output_prefix": f"{cid_str}_min_",
+                "pka_energy_eV": pka_energy_eV,
             })
 
     return tasks
@@ -624,6 +702,7 @@ def run_tasks(tasks, backend, parallel, reference, cedar_executable=None,
                     "cascade_id": task["cascade_id"],
                     "rel_path": task["rel_path"],
                     "state": task["state"],
+                    "pka_energy_eV": task.get("pka_energy_eV"),
                     "n_vacancies": None,
                     "n_sias": None,
                     "n_sia_sites": None,
@@ -688,6 +767,7 @@ def run_tasks(tasks, backend, parallel, reference, cedar_executable=None,
                 "cascade_id": task["cascade_id"],
                 "rel_path": task["rel_path"],
                 "state": task["state"],
+                "pka_energy_eV": task.get("pka_energy_eV"),
                 "n_vacancies": result.get("n_vacancies"),
                 "n_sias": result.get("n_sias"),
                 "n_sia_sites": result.get("n_sia_sites"),
@@ -799,6 +879,8 @@ def write_metadata(output_dir, dataset_cfg, sim_metadata, cascades,
         cascade_records.append({
             "cascade_id": cid,
             "source_path": cascade["rel_path"],
+            "pka_energy_eV": cascade.get("pka_energy_eV"),
+            "log_file": cascade.get("log_file"),
             "states": states,
         })
 
@@ -855,7 +937,7 @@ def write_summary_csv(csv_path, all_results):
     )
 
     fieldnames = [
-        "dataset", "cascade_id", "rel_path", "state",
+        "dataset", "cascade_id", "rel_path", "state", "pka_energy_eV",
         "n_vacancies", "n_sias", "n_sia_sites", "success", "error",
     ]
     with open(csv_path, "w", newline="") as f:
