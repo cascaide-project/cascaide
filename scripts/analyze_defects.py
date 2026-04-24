@@ -4,7 +4,8 @@ Batch defect analysis for cascade simulations.
 
 Processes one or more cascade datasets and runs defect analysis using either
 the OVITO or Cedar backend.  Each cascade has two variants analyzed: minimized
-(``dump.end.min``) and unminimized (``dump.end``).
+(``dump.end.min`` / ``dump.end.min.gz``) and unminimized
+(``dump.end`` / ``dump.end.gz``).
 
 Datasets can be specified via a YAML configuration file (recommended for
 multi-dataset campaigns) **or** via legacy CLI flags for a single dataset.
@@ -60,9 +61,10 @@ def discover_cascades(base_dir):
     """
     Recursively search *base_dir* for cascade dump files.
 
-    A cascade is any directory that contains ``dump.end``.  If the same
-    directory also has ``dump.end.min``, the minimized variant is recorded
-    too.
+    A cascade is any directory that contains ``dump.end`` or ``dump.end.gz``.
+    If the same directory also has ``dump.end.min`` or ``dump.end.min.gz``,
+    the minimized variant is recorded too.  Plain files take precedence over
+    their gzipped counterparts when both are present.
 
     Cascades are sorted by their path relative to *base_dir* (using
     numeric sorting on individual path components where possible) and
@@ -91,18 +93,30 @@ def discover_cascades(base_dir):
         logger.error("Base directory does not exist: %s", base)
         return []
 
+    # Collect cascade directories from both plain and gzipped dump files,
+    # preferring the plain variant when both exist in the same directory.
+    seen_dirs = {}
+    for pattern in ("dump.end", "dump.end.gz"):
+        for dump_end in base.rglob(pattern):
+            cascade_dir = dump_end.parent
+            if cascade_dir not in seen_dirs:
+                seen_dirs[cascade_dir] = dump_end
+
     cascades = []
-    for dump_end in sorted(base.rglob("dump.end")):
-        # Skip if dump.end is actually in a deeper sub-dir we don't want
-        cascade_dir = dump_end.parent
+    for cascade_dir, dump_end in seen_dirs.items():
         rel = cascade_dir.relative_to(base)
         parts = list(rel.parts)
 
+        # Prefer plain dump.end.min; fall back to gzipped variant.
         displaced_min = cascade_dir / "dump.end.min"
+        if not displaced_min.exists():
+            displaced_min_gz = cascade_dir / "dump.end.min.gz"
+            displaced_min = displaced_min_gz if displaced_min_gz.exists() else None
+
         cascades.append({
             "rel_path": str(rel),
             "displaced": str(dump_end),
-            "displaced_min": str(displaced_min) if displaced_min.exists() else None,
+            "displaced_min": str(displaced_min) if displaced_min is not None else None,
             "path_parts": parts,
         })
 
