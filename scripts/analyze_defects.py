@@ -638,6 +638,28 @@ def build_tasks(cascades, dataset_cfg, id_fmt=None):
     return tasks
 
 
+def _read_dump_atom_count(filepath):
+    """Return the atom count from a LAMMPS dump file without loading all data.
+
+    Reads only the header until ``ITEM: NUMBER OF ATOMS`` is found, then
+    returns the integer on the following line.  Returns ``None`` if the file
+    does not exist or cannot be parsed.
+    """
+    path = Path(filepath)
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.strip() == "ITEM: NUMBER OF ATOMS":
+                    count_line = next(f, None)
+                    if count_line is not None:
+                        return int(count_line.strip())
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def _should_skip(task, skip_existing):
     """Check whether this task's output already exists."""
     if not skip_existing:
@@ -698,18 +720,38 @@ def run_tasks(tasks, backend, parallel, reference, cedar_executable=None,
             if _should_skip(task, skip_existing):
                 skipped_count += 1
                 processed += 1
+                prefix = task["output_prefix"]
+                out_dir = Path(task["output_dir"])
+                n_vacancies = _read_dump_atom_count(out_dir / f"{prefix}vac.dump")
+                n_sias = _read_dump_atom_count(out_dir / f"{prefix}sia.dump")
+                n_sia_sites = _read_dump_atom_count(
+                    out_dir / f"{prefix}sia_site.dump"
+                )
+                counts_ok = n_vacancies is not None
+                if counts_ok:
+                    success_count += 1
                 results_log.append({
                     "cascade_id": task["cascade_id"],
                     "rel_path": task["rel_path"],
                     "state": task["state"],
                     "pka_energy_eV": task.get("pka_energy_eV"),
-                    "n_vacancies": None,
-                    "n_sias": None,
-                    "n_sia_sites": None,
-                    "success": "skipped",
-                    "error": "",
-                    "output_files": [],
+                    "n_vacancies": n_vacancies,
+                    "n_sias": n_sias,
+                    "n_sia_sites": n_sia_sites,
+                    "success": True if counts_ok else "skipped",
+                    "error": None if counts_ok else "",
+                    "output_files": [
+                        f"{prefix}{name}"
+                        for name in ("vac.dump", "sia.dump", "sia_site.dump")
+                    ] if counts_ok else [],
                 })
+                cid = task["cascade_id"]
+                if counts_ok:
+                    print(
+                        f"  SKIP #{cid:>4d} ({task['rel_path']}) "
+                        f"{task['state']:<12s}"
+                        f" [vac={n_vacancies}, sia={n_sias}]"
+                    )
                 continue
 
             if backend == "ovito":
