@@ -93,6 +93,8 @@ def discover_cascades(base_dir):
         - ``pka_energy_eV`` : float or None – PKA kinetic energy in eV
                               parsed from ``log.lammps`` (None if the log
                               is absent or the value cannot be found).
+        - ``pka_id``        : int or None – LAMMPS atom ID of the PKA
+                              parsed from ``log.lammps`` (None if absent).
         - ``path_parts``    : list of str – individual directory names
                               (e.g. ``["3", "7"]``).
     """
@@ -123,8 +125,9 @@ def discover_cascades(base_dir):
 
         log_file = cascade_dir / "log.lammps"
         pka_energy_eV = None
+        pka_id = None
         if log_file.exists():
-            pka_energy_eV = parse_pka_energy_from_log(log_file)
+            pka_id, pka_energy_eV = parse_pka_info_from_log(log_file)
         else:
             log_file = None
 
@@ -134,6 +137,7 @@ def discover_cascades(base_dir):
             "displaced_min": str(displaced_min) if displaced_min is not None else None,
             "log_file": str(log_file) if log_file is not None else None,
             "pka_energy_eV": pka_energy_eV,
+            "pka_id": pka_id,
             "path_parts": parts,
         })
 
@@ -358,17 +362,16 @@ def _parse_therm_input(filepath, result):
         result["n_therm_configs"] = int(m.group(1))
 
 
-def parse_pka_energy_from_log(log_path):
+def parse_pka_info_from_log(log_path):
     """
-    Extract the PKA kinetic energy (eV) from a LAMMPS ``log.lammps`` file.
+    Extract the PKA atom ID and kinetic energy from a LAMMPS ``log.lammps``.
 
-    LAMMPS logs the resolved energy via a ``print`` statement of the form::
+    LAMMPS logs both values via a ``print`` statement of the form::
 
         PKAid 45919 Energy 5793.36
 
-    As a fallback the last resolved ``variable Ek equal`` line is used::
-
-        variable Ek equal 5.793360*1000.0
+    If that line is absent, the energy falls back to the last resolved
+    ``variable Ek equal`` line, and the ID is returned as ``None``.
 
     Parameters
     ----------
@@ -377,20 +380,23 @@ def parse_pka_energy_from_log(log_path):
 
     Returns
     -------
-    float or None
-        PKA kinetic energy in eV, or ``None`` if not found / unreadable.
+    tuple of (int or None, float or None)
+        ``(pka_id, pka_energy_eV)``.  Either value may be ``None`` if it
+        cannot be found or the file is unreadable.
     """
     try:
         text = Path(log_path).read_text(errors="replace")
     except OSError as e:
         logger.warning("Could not read log file %s: %s", log_path, e)
-        return None
+        return None, None
 
     # Primary: explicit print line "PKAid <id> Energy <eV>"
-    m = re.search(r"^PKAid\s+\d+\s+Energy\s+(\S+)", text, re.MULTILINE)
+    m = re.search(r"^PKAid\s+(\d+)\s+Energy\s+(\S+)", text, re.MULTILINE)
     if m:
         try:
-            return float(m.group(1))
+            pka_id = int(m.group(1))
+            pka_energy_eV = float(m.group(2))
+            return pka_id, pka_energy_eV
         except ValueError:
             pass
 
@@ -407,12 +413,118 @@ def parse_pka_energy_from_log(log_path):
         if "$" in expr or "{" in expr:
             continue
         try:
-            return float(eval(expr))  # noqa: S307 — log files are local/trusted
+            return None, float(eval(expr))  # noqa: S307 — log files are local/trusted
         except Exception:
             continue
 
     logger.warning("Could not find PKA energy in log file: %s", log_path)
-    return None
+    return None, None
+
+
+def parse_pka_energy_from_log(log_path):
+    """
+    Extract the PKA kinetic energy (eV) from a LAMMPS ``log.lammps`` file.
+
+    .. deprecated::
+        Use :func:`parse_pka_info_from_log` to obtain both the PKA ID and
+        energy in a single pass.
+    """
+    _, energy = parse_pka_info_from_log(log_path)
+    return energy
+
+
+# ---------------------------------------------------------------------------
+# PKA position lookup from reference dump
+# ---------------------------------------------------------------------------
+
+
+def lookup_pka_positions(reference_path, pka_ids):
+    """
+    Look up Cartesian positions for a set of PKA atom IDs in a reference dump.
+
+    Reads the reference dump file once and returns a mapping from atom ID to
+    ``{"x": float, "y": float, "z": float}`` in Angstrom.  IDs not found in
+    the dump are absent from the returned dict.
+
+    The dump must contain an ``ITEM: ATOMS`` header with at minimum the
+    columns ``id``, ``x``, ``y``, and ``z`` (in any order).
+
+    Parameters
+    ----------
+    reference_path : str or Path
+        Path to the LAMMPS reference dump file (plain text or gzipped).
+    pka_ids : collection of int
+        Atom IDs to look up.
+
+    Returns
+    -------
+    dict
+        ``{atom_id: {"x": float, "y": float, "z": float}}``
+    """
+    import gzip
+
+    needed = set(pka_ids) - {None}
+    if not needed:
+        return {}
+
+    ref = Path(reference_path)
+    if not ref.exists():
+        logger.warning("Reference dump not found for PKA lookup: %s", ref)
+        return {}
+
+    positions = {}
+    try:
+        opener = gzip.open if ref.suffix == ".gz" else open
+        with opener(ref, "rt", errors="replace") as fh:
+            col_id = col_x = col_y = col_z = None
+            in_atoms = False
+            for line in fh:
+                if not in_atoms:
+                    if line.startswith("ITEM: ATOMS"):
+                        cols = line.split()[2:]  # strip "ITEM:" and "ATOMS"
+                        try:
+                            col_id = cols.index("id")
+                            col_x = cols.index("x")
+                            col_y = cols.index("y")
+                            col_z = cols.index("z")
+                        except ValueError:
+                            logger.warning(
+                                "Reference dump missing id/x/y/z columns: %s",
+                                ref,
+                            )
+                            return {}
+                        in_atoms = True
+                    continue
+                if line.startswith("ITEM:"):
+                    # New section — stop (single-frame dump)
+                    break
+                parts = line.split()
+                try:
+                    aid = int(parts[col_id])
+                except (IndexError, ValueError):
+                    continue
+                if aid in needed:
+                    try:
+                        positions[aid] = {
+                            "x": float(parts[col_x]),
+                            "y": float(parts[col_y]),
+                            "z": float(parts[col_z]),
+                        }
+                    except (IndexError, ValueError):
+                        pass
+                    if len(positions) == len(needed):
+                        break  # found everything, no need to read further
+    except OSError as e:
+        logger.warning("Could not read reference dump for PKA lookup: %s", e)
+
+    missing = needed - set(positions)
+    if missing:
+        logger.warning(
+            "PKA atom ID(s) not found in reference dump %s: %s",
+            ref,
+            sorted(missing),
+        )
+    return positions
 
 
 # ---------------------------------------------------------------------------
@@ -922,6 +1034,8 @@ def write_metadata(output_dir, dataset_cfg, sim_metadata, cascades,
             "cascade_id": cid,
             "source_path": cascade["rel_path"],
             "pka_energy_eV": cascade.get("pka_energy_eV"),
+            "pka_id": cascade.get("pka_id"),
+            "pka_position_angstrom": cascade.get("pka_position_angstrom"),
             "log_file": cascade.get("log_file"),
             "states": states,
         })
@@ -1186,6 +1300,16 @@ def main(argv=None):
         if not cascades:
             logger.warning("No cascades found in %s — skipping.", base_dir)
             continue
+
+        # Look up PKA starting positions from the reference dump
+        pka_ids = [c["pka_id"] for c in cascades if c.get("pka_id") is not None]
+        if pka_ids:
+            pka_positions = lookup_pka_positions(reference, pka_ids)
+            for c in cascades:
+                c["pka_position_angstrom"] = pka_positions.get(c.get("pka_id"))
+        else:
+            for c in cascades:
+                c["pka_position_angstrom"] = None
 
         # Parse LAMMPS metadata
         sim_metadata = parse_lammps_inputs(base_dir)
