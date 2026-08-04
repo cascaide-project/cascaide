@@ -95,6 +95,10 @@ def discover_cascades(base_dir):
                               is absent or the value cannot be found).
         - ``pka_id``        : int or None – LAMMPS atom ID of the PKA
                               parsed from ``log.lammps`` (None if absent).
+        - ``pka_direction_vector`` : dict or None – dimensionless Cartesian
+                              unit vector recovered from ``pkavelocity``.
+        - ``pka_theta_deg`` : float or None – polar angle from +z.
+        - ``pka_phi_deg``   : float or None – azimuth from +x toward +y.
         - ``path_parts``    : list of str – individual directory names
                               (e.g. ``["3", "7"]``).
     """
@@ -124,11 +128,20 @@ def discover_cascades(base_dir):
             displaced_min = displaced_min_gz if displaced_min_gz.exists() else None
 
         log_file = cascade_dir / "log.lammps"
-        pka_energy_eV = None
-        pka_id = None
+        pka_metadata = {
+            "pka_id": None,
+            "pka_energy_eV": None,
+            "pka_direction_vector": None,
+            "pka_theta_deg": None,
+            "pka_phi_deg": None,
+        }
         if log_file.exists():
-            pka_id, pka_energy_eV = parse_pka_info_from_log(log_file)
+            pka_metadata = parse_pka_metadata_from_log(log_file)
         else:
+            logger.warning(
+                "Could not recover PKA direction; log file is missing: %s",
+                log_file,
+            )
             log_file = None
 
         cascades.append({
@@ -136,8 +149,7 @@ def discover_cascades(base_dir):
             "displaced": str(dump_end),
             "displaced_min": str(displaced_min) if displaced_min is not None else None,
             "log_file": str(log_file) if log_file is not None else None,
-            "pka_energy_eV": pka_energy_eV,
-            "pka_id": pka_id,
+            **pka_metadata,
             "path_parts": parts,
         })
 
@@ -160,6 +172,18 @@ def discover_cascades(base_dir):
     logger.info(
         "Discovered %d cascades in %s", len(cascades), base_dir
     )
+    missing_directions = sum(
+        c["pka_direction_vector"] is None for c in cascades
+    )
+    if missing_directions:
+        logger.warning(
+            "PKA direction unavailable for %d of %d cascades in %s",
+            missing_directions,
+            len(cascades),
+            base_dir,
+        )
+    else:
+        logger.info("Recovered PKA direction for all %d cascades", len(cascades))
     return cascades
 
 
@@ -362,58 +386,145 @@ def _parse_therm_input(filepath, result):
         result["n_therm_configs"] = int(m.group(1))
 
 
+def parse_pka_metadata_from_log(log_path):
+    """Extract PKA identity, energy, and applied direction from a LAMMPS log.
+
+    Direction is recovered from the resolved ``pkavelocity vx vy vz`` record,
+    which represents the velocity actually supplied to LAMMPS.  Any separately
+    printed theta/phi values are deliberately ignored because repeated
+    expansion of equal-style random variables can make those values differ
+    from the applied velocity.
+
+    Returns a dict whose direction vector and derived angles are all ``None``
+    if the velocity record is missing, malformed, non-finite, or zero-length.
+    PKA ID and energy parsing remains independent of direction recovery.
+    """
+    metadata = {
+        "pka_id": None,
+        "pka_energy_eV": None,
+        "pka_direction_vector": None,
+        "pka_theta_deg": None,
+        "pka_phi_deg": None,
+    }
+
+    try:
+        text = Path(log_path).read_text(errors="replace")
+    except OSError as e:
+        logger.warning("Could not read log file %s: %s", log_path, e)
+        logger.warning(
+            "Could not recover PKA direction from unreadable log: %s", log_path
+        )
+        return metadata
+
+    # Primary identity/energy record: "PKAid <id> Energy <eV>".
+    m = re.search(r"^PKAid\s+(\d+)\s+Energy\s+(\S+)", text, re.MULTILINE)
+    if m:
+        try:
+            pka_id = int(m.group(1))
+            pka_energy_eV = float(m.group(2))
+        except ValueError:
+            pass
+        else:
+            metadata["pka_id"] = pka_id
+            metadata["pka_energy_eV"] = pka_energy_eV
+
+    # Preserve the existing energy fallback when the explicit record is
+    # absent or malformed.
+    if metadata["pka_energy_eV"] is None:
+        matches = re.findall(
+            r"^\s*variable\s+Ek\s+equal\s+(.+)", text, re.MULTILINE
+        )
+        for expr in reversed(matches):
+            expr = expr.strip()
+            if "$" in expr or "{" in expr:
+                continue
+            try:
+                metadata["pka_energy_eV"] = float(eval(expr))  # noqa: S307
+                break
+            except Exception:
+                continue
+
+    if metadata["pka_energy_eV"] is None:
+        logger.warning("Could not find PKA energy in log file: %s", log_path)
+
+    velocity_matches = re.findall(
+        r"^\s*pkavelocity\s+(\S+)\s+(\S+)\s+(\S+)\s*$",
+        text,
+        re.MULTILINE,
+    )
+    if not velocity_matches:
+        logger.warning(
+            "Could not recover PKA direction; missing or malformed "
+            "pkavelocity record in %s",
+            log_path,
+        )
+        return metadata
+
+    try:
+        velocity = tuple(float(value) for value in velocity_matches[-1])
+    except ValueError:
+        logger.warning(
+            "Could not recover PKA direction; malformed pkavelocity record in %s",
+            log_path,
+        )
+        return metadata
+
+    if not all(math.isfinite(value) for value in velocity):
+        logger.warning(
+            "Could not recover PKA direction; non-finite pkavelocity in %s",
+            log_path,
+        )
+        return metadata
+
+    speed = math.sqrt(sum(value * value for value in velocity))
+    if not math.isfinite(speed) or math.isclose(speed, 0.0, abs_tol=1e-15):
+        logger.warning(
+            "Could not recover PKA direction; zero-length pkavelocity in %s",
+            log_path,
+        )
+        return metadata
+
+    dx, dy, dz = (value / speed for value in velocity)
+    direction_norm = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if not math.isclose(direction_norm, 1.0, rel_tol=1e-12, abs_tol=1e-12):
+        logger.warning(
+            "Could not recover PKA direction; normalization failed for %s",
+            log_path,
+        )
+        return metadata
+
+    metadata["pka_direction_vector"] = {"x": dx, "y": dy, "z": dz}
+    metadata["pka_theta_deg"] = math.degrees(
+        math.acos(max(-1.0, min(1.0, dz)))
+    )
+    metadata["pka_phi_deg"] = math.degrees(math.atan2(dy, dx)) % 360.0
+    return metadata
+
+
 def parse_pka_info_from_log(log_path):
-    """
-    Extract the PKA atom ID and kinetic energy from a LAMMPS ``log.lammps``.
-
-    LAMMPS logs both values via a ``print`` statement of the form::
-
-        PKAid 45919 Energy 5793.36
-
-    If that line is absent, the energy falls back to the last resolved
-    ``variable Ek equal`` line, and the ID is returned as ``None``.
-
-    Parameters
-    ----------
-    log_path : str or Path
-        Path to the LAMMPS log file.
-
-    Returns
-    -------
-    tuple of (int or None, float or None)
-        ``(pka_id, pka_energy_eV)``.  Either value may be ``None`` if it
-        cannot be found or the file is unreadable.
-    """
+    """Extract the PKA atom ID and kinetic energy from a LAMMPS log."""
     try:
         text = Path(log_path).read_text(errors="replace")
     except OSError as e:
         logger.warning("Could not read log file %s: %s", log_path, e)
         return None, None
 
-    # Primary: explicit print line "PKAid <id> Energy <eV>"
     m = re.search(r"^PKAid\s+(\d+)\s+Energy\s+(\S+)", text, re.MULTILINE)
     if m:
         try:
-            pka_id = int(m.group(1))
-            pka_energy_eV = float(m.group(2))
-            return pka_id, pka_energy_eV
+            return int(m.group(1)), float(m.group(2))
         except ValueError:
             pass
 
-    # Fallback: last resolved "variable Ek equal <expr>" line.
-    # LAMMPS echoes both the template form (${my_pka}*1000.0) and the
-    # expanded form (5.793360*1000.0); take the last match so we get the
-    # numeric expression rather than the template.
     matches = re.findall(
         r"^\s*variable\s+Ek\s+equal\s+(.+)", text, re.MULTILINE
     )
     for expr in reversed(matches):
         expr = expr.strip()
-        # Skip template expressions that still contain variable references
         if "$" in expr or "{" in expr:
             continue
         try:
-            return None, float(eval(expr))  # noqa: S307 — log files are local/trusted
+            return None, float(eval(expr))  # noqa: S307
         except Exception:
             continue
 
@@ -723,6 +834,14 @@ def build_tasks(cascades, dataset_cfg, id_fmt=None):
         cid_str = id_fmt.format(cid)
 
         pka_energy_eV = cascade.get("pka_energy_eV")
+        direction = cascade.get("pka_direction_vector") or {}
+        direction_metadata = {
+            "pka_direction_x": direction.get("x"),
+            "pka_direction_y": direction.get("y"),
+            "pka_direction_z": direction.get("z"),
+            "pka_theta_deg": cascade.get("pka_theta_deg"),
+            "pka_phi_deg": cascade.get("pka_phi_deg"),
+        }
 
         # Unminimized
         tasks.append({
@@ -733,6 +852,7 @@ def build_tasks(cascades, dataset_cfg, id_fmt=None):
             "output_dir": output_dir,
             "output_prefix": f"{cid_str}_",
             "pka_energy_eV": pka_energy_eV,
+            **direction_metadata,
         })
 
         # Minimized (if available)
@@ -745,6 +865,7 @@ def build_tasks(cascades, dataset_cfg, id_fmt=None):
                 "output_dir": output_dir,
                 "output_prefix": f"{cid_str}_min_",
                 "pka_energy_eV": pka_energy_eV,
+                **direction_metadata,
             })
 
     return tasks
@@ -847,6 +968,11 @@ def run_tasks(tasks, backend, parallel, reference, cedar_executable=None,
                     "rel_path": task["rel_path"],
                     "state": task["state"],
                     "pka_energy_eV": task.get("pka_energy_eV"),
+                    "pka_direction_x": task.get("pka_direction_x"),
+                    "pka_direction_y": task.get("pka_direction_y"),
+                    "pka_direction_z": task.get("pka_direction_z"),
+                    "pka_theta_deg": task.get("pka_theta_deg"),
+                    "pka_phi_deg": task.get("pka_phi_deg"),
                     "n_vacancies": n_vacancies,
                     "n_sias": n_sias,
                     "n_sia_sites": n_sia_sites,
@@ -922,6 +1048,11 @@ def run_tasks(tasks, backend, parallel, reference, cedar_executable=None,
                 "rel_path": task["rel_path"],
                 "state": task["state"],
                 "pka_energy_eV": task.get("pka_energy_eV"),
+                "pka_direction_x": task.get("pka_direction_x"),
+                "pka_direction_y": task.get("pka_direction_y"),
+                "pka_direction_z": task.get("pka_direction_z"),
+                "pka_theta_deg": task.get("pka_theta_deg"),
+                "pka_phi_deg": task.get("pka_phi_deg"),
                 "n_vacancies": result.get("n_vacancies"),
                 "n_sias": result.get("n_sias"),
                 "n_sia_sites": result.get("n_sia_sites"),
@@ -1036,6 +1167,9 @@ def write_metadata(output_dir, dataset_cfg, sim_metadata, cascades,
             "pka_energy_eV": cascade.get("pka_energy_eV"),
             "pka_id": cascade.get("pka_id"),
             "pka_position_angstrom": cascade.get("pka_position_angstrom"),
+            "pka_direction_vector": cascade.get("pka_direction_vector"),
+            "pka_theta_deg": cascade.get("pka_theta_deg"),
+            "pka_phi_deg": cascade.get("pka_phi_deg"),
             "log_file": cascade.get("log_file"),
             "states": states,
         })
@@ -1094,7 +1228,9 @@ def write_summary_csv(csv_path, all_results):
 
     fieldnames = [
         "dataset", "cascade_id", "rel_path", "state", "pka_energy_eV",
-        "n_vacancies", "n_sias", "n_sia_sites", "success", "error",
+        "pka_direction_x", "pka_direction_y", "pka_direction_z",
+        "pka_theta_deg", "pka_phi_deg", "n_vacancies", "n_sias",
+        "n_sia_sites", "success", "error",
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
